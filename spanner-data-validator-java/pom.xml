@@ -403,6 +403,12 @@
       <version>2.15.1</version>
     </dependency>
 
+    <!-- Adds a dependency on the AutoValue module. -->
+    <dependency>
+      <groupId>com.google.auto.value</groupId>
+      <artifactId>auto-value</artifactId>
+      <version>1.10.4</version>
+    </dependency>
     <!-- Adds a dependency on the Python Multi-language pipelines API module. -->
     <dependency>
       <groupId>org.apache.beam</groupId>
