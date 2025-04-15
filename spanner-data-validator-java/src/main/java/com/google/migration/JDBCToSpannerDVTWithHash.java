@@ -35,6 +35,7 @@ import static com.google.migration.TableSpecList.getTableSpecs;
 import com.google.api.services.bigquery.model.TableFieldSchema;
 import com.google.api.services.bigquery.model.TableRow;
 import com.google.api.services.bigquery.model.TableSchema;
+import com.google.cloud.Timestamp;
 import com.google.cloud.spanner.Statement;
 import com.google.cloud.spanner.Struct;
 import com.google.migration.common.DVTOptionsCore;
@@ -52,14 +53,21 @@ import com.google.migration.dto.SourceRecord;
 import com.google.migration.dto.TableSpec;
 import com.google.migration.dto.session.Schema;
 import com.google.migration.dto.session.SessionFileReader;
+import com.google.migration.merkle.CompareRecordsDoFn;
+import com.google.migration.merkle.ComparisonResult;
+import com.google.migration.merkle.MySqlRecord;
 import com.google.migration.partitioning.PartitionRangeListFetcher;
 import com.google.migration.partitioning.PartitionRangeListFetcherFactory;
 import com.google.migration.transform.CustomTransformation;
 import java.io.IOException;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import org.apache.beam.sdk.Pipeline;
+import org.apache.beam.sdk.coders.KvCoder;
+import org.apache.beam.sdk.coders.SerializableCoder;
+import org.apache.beam.sdk.coders.StringUtf8Coder;
 import org.apache.beam.sdk.extensions.avro.coders.AvroCoder;
 import org.apache.beam.sdk.io.gcp.bigquery.BigQueryIO;
 import org.apache.beam.sdk.io.gcp.bigquery.BigQueryIO.Write;
@@ -69,6 +77,7 @@ import org.apache.beam.sdk.io.gcp.spanner.ReadOperation;
 import org.apache.beam.sdk.io.gcp.spanner.SpannerIO;
 import org.apache.beam.sdk.io.jdbc.JdbcIO;
 import org.apache.beam.sdk.io.jdbc.JdbcIO.DataSourceConfiguration;
+import org.apache.beam.sdk.options.PipelineOptions;
 import org.apache.beam.sdk.options.PipelineOptionsFactory;
 import org.apache.beam.sdk.transforms.Count;
 import org.apache.beam.sdk.transforms.Create;
@@ -89,6 +98,7 @@ import org.apache.beam.sdk.values.PCollectionView;
 import org.apache.beam.sdk.values.TupleTag;
 import org.apache.beam.sdk.values.TupleTagList;
 import org.apache.beam.sdk.values.TypeDescriptor;
+import org.apache.beam.sdk.values.TypeDescriptors;
 import org.joda.time.DateTime;
 import org.joda.time.format.DateTimeFormat;
 import org.joda.time.format.DateTimeFormatter;
@@ -756,13 +766,88 @@ public class JDBCToSpannerDVTWithHash {
   }
 
   public static void main(String[] args) throws IOException {
-    JDBCToSpannerDVTWithHashOptions options =
-        PipelineOptionsFactory
-            .fromArgs(args)
-            .withValidation()
-            .as(JDBCToSpannerDVTWithHashOptions.class);
+    PipelineOptions options = PipelineOptionsFactory.fromArgs(args).withValidation().create();
+    Pipeline p = Pipeline.create(options);
 
-    JDBCToSpannerDVTWithHash dvtApp = new JDBCToSpannerDVTWithHash();
-    dvtApp.runDVT(options);
+// --- Define consistent column order (must match fields used in MerkleUtils) ---
+// Make sure these names match the cases in the MerkleUtils.buildMerkleTree switch statement
+    List<String> columnOrder = Arrays.asList("id", "user_name", "score", "last_active");
+
+
+// --- Define TupleTags with the POJO type ---
+    final TupleTag<MySqlRecord> mysqlTag = new TupleTag<>("mysql_data");
+    final TupleTag<MySqlRecord> spannerTag = new TupleTag<>("spanner_data");
+
+// --- Read from MySQL and map to MySqlRecord POJO ---
+    PCollection<KV<String, MySqlRecord>> mysqlData = p
+        .apply("ReadMySQL", JdbcIO.<KV<String, MySqlRecord>>read()
+            .withDataSourceConfiguration(JdbcIO.DataSourceConfiguration.create(
+                    "com.mysql.cj.jdbc.Driver", "jdbc:mysql://10.36.112.26:3306/merkle?...") // Add query params if needed
+                .withUsername("hbuser-2").withPassword("hbpwd"))
+            .withQuery("SELECT id, user_name, score, last_active FROM merkle_table")
+            .withRowMapper((JdbcIO.RowMapper<KV<String, MySqlRecord>>) rs -> {
+              MySqlRecord record = new MySqlRecord();
+              String key = String.valueOf(rs.getInt("id"));
+              record.setId(rs.getInt("id"));
+              record.setUserName(rs.getString("user_name"));
+              record.setScore(rs.getDouble("score"));
+              java.sql.Timestamp ts = rs.getTimestamp("last_active");
+              // Ensure the fields within MySqlRecord are also Serializable (Instant is)
+              record.setLastActive(ts != null ? ts.toInstant() : null);
+              return KV.of(key, record);
+            })
+            // This should now compile since MySqlRecord implements Serializable
+            .withCoder(KvCoder.of(StringUtf8Coder.of(), SerializableCoder.of(MySqlRecord.class)))
+        );
+
+
+// --- Read from Spanner and map to MySqlRecord POJO ---
+    PCollection<KV<String, MySqlRecord>> spannerData = p
+        .apply("ReadSpanner", SpannerIO.read()
+            .withInstanceId("manit-testing-us")
+            .withDatabaseId("merkle")
+            .withQuery("SELECT id, user_name, score, last_active FROM merkle_table"))
+        // Updated MapElements to create MySqlRecord
+        .apply("MapSpannerToKV", MapElements
+            // Input is Spanner Struct, Output is KV<String, MySqlRecord>
+            .into(TypeDescriptors.kvs(TypeDescriptors.strings(), TypeDescriptor.of(MySqlRecord.class)))
+            .via((com.google.cloud.spanner.Struct struct) -> {
+                  MySqlRecord record = new MySqlRecord();
+                  // Assuming 'id' is key and Spanner INT64 maps to Long
+                  String key = String.valueOf(struct.getLong("id"));
+                  record.setId(struct.isNull("id") ? null : Math.toIntExact(struct.getLong("id"))); // Careful with potential overflow if ID > Integer.MAX_VALUE
+                  record.setUserName(struct.isNull("user_name") ? null : struct.getString("user_name"));
+                  record.setScore(struct.isNull("score") ? null : struct.getDouble("score")); // Spanner FLOAT64 maps to Double
+
+                  // Convert Spanner Timestamp to java.time.Instant
+                  Instant lastActiveInstant = null;
+                  if (!struct.isNull("last_active")) {
+                    Timestamp spannerTs = struct.getTimestamp("last_active");
+                    lastActiveInstant = Instant.ofEpochSecond(spannerTs.getSeconds());
+                  }
+                  record.setLastActive(lastActiveInstant);
+
+                  return KV.of(key, record);
+                }
+            ));
+    // No .withCoder needed here either, should use AvroCoder for MySqlRecord
+
+
+// --- CoGroup and Compare ---
+    PCollection<KV<String, ComparisonResult>> comparisonResults =
+        KeyedPCollectionTuple.of(mysqlTag, mysqlData) // Use the tags with POJO type
+            .and(spannerTag, spannerData)
+            .apply("CoGroupRecords", CoGroupByKey.create())
+            // Instantiate DoFn with updated tags and only columnOrder
+            .apply("CompareRecords", ParDo.of(new CompareRecordsDoFn(mysqlTag, spannerTag, columnOrder)));
+
+// --- Output results (remains the same) ---
+    comparisonResults.apply("LogResults", MapElements.into(TypeDescriptors.voids()).via(kv -> {
+      LOG.info("Comparison for key {}: {}", kv.getKey(), kv.getValue());
+      // System.out.println("Comparison for key "+ kv.getKey()+ ": "+ kv.getValue()); // Alternative output
+      return null;
+    }));
+
+    p.run().waitUntilFinish();
   }
 } // class JDBCToSpannerDVTWithHash
