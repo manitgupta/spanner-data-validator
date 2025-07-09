@@ -32,6 +32,7 @@ import static com.google.migration.SharedTags.unmatchedSpannerRecordValuesTag;
 import static com.google.migration.SharedTags.unmatchedSpannerRecordsTag;
 import static com.google.migration.TableSpecList.getTableSpecs;
 
+import com.google.api.services.bigquery.model.Table;
 import com.google.api.services.bigquery.model.TableFieldSchema;
 import com.google.api.services.bigquery.model.TableRow;
 import com.google.api.services.bigquery.model.TableSchema;
@@ -42,11 +43,14 @@ import com.google.migration.common.DVTOptionsCore;
 import com.google.migration.common.FilteryByShard;
 import com.google.migration.common.HikariPoolableDataSourceProvider;
 import com.google.migration.common.JDBCRowMapper;
+import com.google.migration.common.JDBCShard;
 import com.google.migration.common.SecretManagerAccessorImpl;
 import com.google.migration.common.ShardFileReader;
 import com.google.migration.dofns.CountMatchesDoFn;
 import com.google.migration.dofns.CountMatchesWithShardFilteringDoFn;
 import com.google.migration.dofns.CustomTransformationDoFn;
+import com.google.migration.dofns.FetchPartitionDataDoFn;
+import com.google.migration.dofns.GeneratePartitionsFastFn;
 import com.google.migration.dofns.MapWithRangeFn;
 import com.google.migration.dofns.MapWithRangeFn.MapWithRangeType;
 import com.google.migration.dto.ComparerResult;
@@ -61,12 +65,12 @@ import com.google.migration.partitioning.PartitionRangeListFetcher;
 import com.google.migration.partitioning.PartitionRangeListFetcherFactory;
 import com.google.migration.transform.CustomTransformation;
 import java.io.IOException;
-import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
+import javax.sql.DataSource;
 import org.apache.beam.sdk.Pipeline;
 import org.apache.beam.sdk.extensions.avro.coders.AvroCoder;
 import org.apache.beam.sdk.io.gcp.bigquery.BigQueryIO;
@@ -100,8 +104,12 @@ import org.apache.beam.sdk.values.PCollectionView;
 import org.apache.beam.sdk.values.TupleTag;
 import org.apache.beam.sdk.values.TupleTagList;
 import org.apache.beam.sdk.values.TypeDescriptor;
+import org.checkerframework.checker.initialization.qual.Initialized;
+import org.checkerframework.checker.nullness.qual.NonNull;
+import org.checkerframework.checker.nullness.qual.UnknownKeyFor;
 import org.jetbrains.annotations.NotNull;
 import org.joda.time.DateTime;
+import org.joda.time.Duration;
 import org.joda.time.format.DateTimeFormat;
 import org.joda.time.format.DateTimeFormatter;
 import org.slf4j.Logger;
@@ -960,7 +968,58 @@ public class JDBCToSpannerDVTWithHash {
       schema = SessionFileReader.read(options.getSessionFileJson());
     }
 
-    List<TableSpec> tableSpecs = generateTableSpec(options);
+    PCollection<TableSpec> tableSpecs = p.apply("CreateTableSpec", Create.of(generateTableSpec(options)));
+    List<JDBCShard> shardList = new ShardFileReader(new SecretManagerAccessorImpl()).readShardingConfig(options.getSourceConfigURL())
+        .stream().map(
+            shard -> {
+              String zeroDateTimeNullBehaviorStr = options.getZeroDateTimeBehavior() ? "?zeroDateTimeBehavior=CONVERT_TO_NULL" : "";
+
+              // JDBC conn string
+              String connString = String.format("jdbc:%s://%s:%d/%s%s", options.getProtocol(),
+                  shard.getHost(),
+                  Integer.parseInt(shard.getPort()),
+                  shard.getDbName(),
+                  zeroDateTimeNullBehaviorStr);
+              return new JDBCShard(connString, shard.getUserName(), shard.getPassword());
+            }
+        ).collect(Collectors.toList());
+
+    PCollectionView<List<JDBCShard>> shardSideInput = p.apply("CreateShards", Create.of(shardList)).apply("ShardsSideInput", View.asList());
+
+    PCollection<KV<JDBCShard, TableSpec>> shardTablePairs = tableSpecs.apply("CreateShardTableSpecPairs",
+        ParDo.of(new DoFn<TableSpec, KV<JDBCShard, TableSpec>>() {
+          @ProcessElement
+          public void processElement(ProcessContext c) {
+            TableSpec tableSpec = c.element();
+            List<JDBCShard> shards = c.sideInput(shardSideInput);
+            for (JDBCShard shard: shards) {
+              c.output(KV.of(shard, tableSpec));
+            }
+          }
+        }).withSideInputs(shardSideInput));
+
+    String driver = POSTGRES_JDBC_DRIVER;
+    if(options.getProtocol().compareTo("mysql") == 0) {
+      driver = MYSQL_JDBC_DRIVER;
+    }
+
+    SerializableFunction<String, DataSource> hikariDataSourceFn = HikariPoolableDataSourceProvider
+        .of(driver, shardList, options.getMaxJDBCConnectionsPerJVM());
+
+    PCollection<KV<String, PartitionRange>> partitions = shardTablePairs.apply("GeneratePartitions",
+        ParDo.of(new GeneratePartitionsFastFn(hikariDataSourceFn, options.getSourceDB())));
+
+    PCollection<SourceRecord> jdbcRecords = partitions
+        .apply("Shuffle Partitions", Reshuffle.viaRandomKey())
+        .apply("FetchPartitionData",
+            ParDo.of(new FetchPartitionDataDoFn(hikariDataSourceFn)));
+
+    PCollection<KV<String, HashResult>> mappedWithHashJdbcRecords =
+        jdbcRecords
+            .apply("MapWithRangesJDBCRecordsForTable", ParDo.of(new MapWithRangeFn(partitionRangesView,
+                    MapWithRangeType.RANGE_PLUS_HASH,
+                    tableSpec.getRangeFieldType()))
+                .withSideInputs(partitionRangesView));
 
     PipelineTracker pipelineTracker = new PipelineTracker();
     pipelineTracker.setMaxTablesInEffectAtOneTime(options.getMaxTablesInEffectAtOneTime());

@@ -4,7 +4,10 @@ import java.io.Serializable;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Objects;
+import org.apache.beam.sdk.coders.DefaultCoder;
+import org.apache.beam.sdk.coders.SerializableCoder;
 
+@DefaultCoder(SerializableCoder.class)
 public class Shard implements Serializable {
 
   private String logicalShardId;

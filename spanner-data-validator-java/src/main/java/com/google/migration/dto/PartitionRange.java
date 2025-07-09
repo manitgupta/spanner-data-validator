@@ -45,8 +45,22 @@ public class PartitionRange {
   public PartitionRange() {
   }
 
-  public PartitionRange(String startRange, String endRange) {
+  public String getTableName() {
+    return tableName;
+  }
+
+  String tableName;
+
+  String partitionColumn;
+
+  public String getPartitionColumn() {
+    return partitionColumn;
+  }
+
+  public PartitionRange(String startRange, String endRange, String tableName, String partitionColumn) {
     this.startRange = startRange;
     this.endRange = endRange;
+    this.tableName = tableName;
+    this.partitionColumn = partitionColumn;
   }
 } // class PartitionRange

@@ -1,62 +1,50 @@
 package com.google.migration.common;
 
 import com.zaxxer.hikari.HikariDataSource;
+import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
 import javax.sql.DataSource;
 import org.apache.beam.sdk.transforms.SerializableFunction;
 
-public class HikariPoolableDataSourceProvider implements SerializableFunction<Void, DataSource> {
+public class HikariPoolableDataSourceProvider implements SerializableFunction<String, DataSource> {
+
   private static final ConcurrentHashMap<String, DataSource> instances =
       new ConcurrentHashMap<>();
 
-  private final String driverClassName;
-  private final String username;
-  private final String password;
-  private final String jdbcUrl;
-  private final Integer maxConnections;
-
-  private HikariPoolableDataSourceProvider(String jdbcUrlIn,
-      String usernameIn,
-      String passwordIn,
+  private HikariPoolableDataSourceProvider(
       String driverClassNameIn,
+      List<JDBCShard> jdbcShardList,
       Integer maxConnectionsIn) {
-    this.driverClassName = driverClassNameIn;
-    this.username = usernameIn;
-    this.password = passwordIn;
-    this.jdbcUrl = jdbcUrlIn;
-    this.maxConnections = maxConnectionsIn;
+    jdbcShardList.forEach(
+        jdbcShard -> {
+          instances.computeIfAbsent(jdbcShard.getJdbcUrl(), ignored -> {
+            HikariDataSource ds = new HikariDataSource();
+            ds.setJdbcUrl(jdbcShard.getJdbcUrl());
+            ds.setUsername(jdbcShard.getUsername());
+            ds.setPassword(jdbcShard.getPassword());
+            ds.setDriverClassName(driverClassNameIn);
+            ds.setMaximumPoolSize(maxConnectionsIn);
+            //Various other connection pool settings.
+            ds.setKeepaliveTime(30000);
+            ds.setMaxLifetime(31000);
+            ds.setConnectionTimeout(1000 * 3600 * 3);
+            return ds;
+          });
+        }
+    );
   }
 
-  public static SerializableFunction<Void, DataSource> of(String jdbcUrlIn,
-      String usernameIn,
-      String passwordIn,
+  public static SerializableFunction<String, DataSource> of(
       String driverClassNameIn,
+      List<JDBCShard> jdbcShardList,
       Integer maxConnectionsIn) {
-    return new HikariPoolableDataSourceProvider(jdbcUrlIn,
-        usernameIn,
-        passwordIn,
-        driverClassNameIn,
+    return new HikariPoolableDataSourceProvider(driverClassNameIn,
+        jdbcShardList,
         maxConnectionsIn);
   }
 
   @Override
-  public DataSource apply(Void input) {
-    return instances.computeIfAbsent(
-        this.jdbcUrl,
-        ignored -> {
-
-          HikariDataSource ds = new HikariDataSource();
-          ds.setJdbcUrl(this.jdbcUrl);
-          ds.setUsername(this.username);
-          ds.setPassword(this.password);
-          ds.setDriverClassName(this.driverClassName);
-
-          ds.setMaximumPoolSize(maxConnections);
-          ds.setKeepaliveTime(30000);
-          ds.setMaxLifetime(31000);
-          ds.setConnectionTimeout(1000 * 3600 * 3);
-
-          return ds;
-        });
+  public DataSource apply(String jdbcUrl) {
+    return instances.get(jdbcUrl);
   }
 }
